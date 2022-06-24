@@ -9,6 +9,7 @@
 
 #define MAX_PEERS 128  /* Max number of peers in a cluster */
 #define APPLY_RATE 125 /* Apply a new entry every 125 milliseconds */
+#define ADDR_LEN 64    /* The (maximum) length of an IP:PORT pair */
 
 #define Log(SERVER_ID, FORMAT) printf("%d: " FORMAT "\n", SERVER_ID)
 #define Logf(SERVER_ID, FORMAT, ...) \
@@ -58,7 +59,7 @@ static int FsmApply(struct raft_fsm *fsm,
 {
     struct Fsm *f = fsm->data;
     if (buf->len != sizeof(struct fsm_op)) {
-        printf("Malformed: expected length %ld, got %ld\n", sizeof(struct fsm_op), buf->len);
+        fprintf(stderr, "Malformed: expected length %ld, got %ld\n", sizeof(struct fsm_op), buf->len);
         return RAFT_MALFORMED;
     }
     struct fsm_op* op = buf->base;
@@ -72,9 +73,9 @@ static int FsmApply(struct raft_fsm *fsm,
             break;
     }
     if (op->type == OP_READ) {
-        printf("R: %lld\n", f->reg);
+        fprintf(stderr, "R: %lld\n", f->reg);
     } else {
-        printf("W -> %lld\n", f->reg);
+        fprintf(stderr, "W -> %lld\n", f->reg);
     }
     return 0;
 }
@@ -103,12 +104,12 @@ static int FsmRestore(struct raft_fsm *fsm, struct raft_buffer *buf)
 {
     struct Fsm *f = fsm->data;
     if (buf->len != sizeof(uint64_t)) {
-        printf("Malformed during attemmpted restore.\n");
+        fprintf(stderr, "Malformed during attempted restore.\n");
         return RAFT_MALFORMED;
     }
     f->reg = *(uint64_t *)buf->base;
     raft_free(buf->base);
-    printf("Restored value: %lld\n", f->reg);
+    fprintf(stderr, "Restored value: %lld\n", f->reg);
     return 0;
 }
 
@@ -430,6 +431,12 @@ typedef struct {
     uv_stream_t *client;
 } client_request_ident;
 
+typedef struct {
+    void *data;
+    raft_id serv_id;
+    char serv_address[ADDR_LEN];
+} add_server_t;
+
 void alloc_buffer(uv_handle_t* handle, size_t suggested_size, uv_buf_t* buf);
 void on_new_connection(uv_stream_t *server, int status);
 void read_cb(uv_stream_t *client, ssize_t nread, const uv_buf_t *buf);
@@ -481,6 +488,21 @@ void reply_with_leader_address(struct Server *s, uv_stream_t *client) {
 
 }
 
+void promote_server_to_voter_after_join(struct raft_change *req, int status) {
+    add_server_t *as = req->data;
+    struct Server *s = as->data;
+
+    int rv = raft_assign(&s->raft, req, as->serv_id, RAFT_VOTER, NULL);
+    fprintf(stderr, "[Add CB status: %d] Trying to make server ID %llu (%s) a voter -> RET %s\n", status, as->serv_id, as->serv_address, rv == 0 ? "OK" : raft_strerror(rv));
+    // TODO: free memory
+}
+
+void after_removal(struct raft_change *req, int status) {
+    add_server_t *as = req->data;
+    struct Server *s = as->data;
+    fprintf(stderr, "Removed server ID %llu -> RET %d\n", as->serv_id, status);
+}
+
 void read_cb(uv_stream_t* client, ssize_t nread, const uv_buf_t* buf) {
     // Compare with serverTimerCb
     // check if Raft leader
@@ -497,31 +519,76 @@ void read_cb(uv_stream_t* client, ssize_t nread, const uv_buf_t* buf) {
     char *cmd = buf->base;
     // Logf(s->id, "Received request: %s", cmd);
     if (nread > 0) {
-        // Only accept R or W [int] requests
-        if (!(cmd[0] == 'R' || cmd[0] == 'W')) {
-            Logf(s->id, "Invalid request: %s", cmd);
+        // Specially handle configuration change requests
+        // A = Add [id] [ip:port]
+        // R = Remove [id]
+        if (cmd[0] == 'A' || cmd[0] == 'D') {
+            // fprintf(stderr, "Received membership request: %s", cmd);
+            int rv;
+            raft_id serv_id;
+
+            if (cmd[0] == 'A') {
+                char serv_address[ADDR_LEN];
+                sscanf(cmd, "A %llu %s", &serv_id, &serv_address);
+
+                add_server_t *as = raft_malloc(sizeof *as);
+                as->data = s;
+                as->serv_id = serv_id;
+                strncpy(as->serv_address, serv_address, ADDR_LEN);
+
+                struct raft_change *rc = raft_malloc(sizeof *rc);
+                rc->data = as;
+                rc->cb = NULL;
+                // By default, nodes are given the RAFT_STANDY log --> they replicate the log, but do not vote
+                // after the add completes, promote_server is called (callback) to make it a voter
+                rv = raft_add(&s->raft, rc, serv_id, serv_address, promote_server_to_voter_after_join);
+                fprintf(stderr, "Trying to add server with ID %llu at %s -> RET %s\n", serv_id, serv_address, rv == 0 ? "OK" : raft_strerror(rv));
+            } else { // (cmd[0] == 'D')
+                sscanf(cmd, "D %llu", &serv_id);
+                add_server_t *as = raft_malloc(sizeof *as);
+                as->data = s;
+                as->serv_id = serv_id;
+                strncpy(as->serv_address, "", ADDR_LEN);
+
+                struct raft_change *rc = raft_malloc(sizeof *rc);
+                rc->data = as;
+                rc->cb = NULL;
+                rv = raft_remove(&s->raft, rc, serv_id, after_removal);
+                fprintf(stderr, "Trying to remove server with ID %llu -> RET %s\n", serv_id, rv == 0 ? "OK" : raft_strerror(rv));
+            }
+            // TODO: respond with status message
+            // char *str_ret = rv == 0 ? "OK" : raft_strerror(rv);
+            // Close the connection to the client after scheduling the configuration change
             uv_close((uv_handle_t*)client, NULL);
-        }
+        } else {
+            // Only accept R or W [int] requests
+            if (!(cmd[0] == 'R' || cmd[0] == 'W')) {
+                Logf(s->id, "Invalid request: %s", cmd);
+                uv_close((uv_handle_t*)client, NULL);
+                return;
+            }
 
-        // Parse request
-        enum fsm_op_type t = cmd[0] == 'R' ? OP_READ : OP_WRITE;
-        uint64_t val = 0;
-        if (t == OP_WRITE) {
-            val = (uint64_t) atoi(&cmd[1]);
-        }
-        // TODO: add OOM checks
-        struct raft_buffer rb = CreateRequest(t, val); // FIXME: I suppose this gets freed by raft_apply?
-        // Logf(s->id, "Parsed request: %c %lu", cmd[0], val);
-        struct raft_apply *creq = raft_malloc(sizeof *creq);
-        client_request_ident *cri = raft_malloc(sizeof *cri);
-        cri->server = s;
-        cri->client = client;
-        creq->data = cri;
+            // fprintf(stderr, "Received KV request: %s", cmd);
+            // Parse request
+            enum fsm_op_type t = cmd[0] == 'R' ? OP_READ : OP_WRITE;
+            uint64_t val = 0;
+            if (t == OP_WRITE) {
+                val = (uint64_t) atoi(&cmd[1]);
+            }
+            // TODO: add OOM checks
+            struct raft_buffer rb = CreateRequest(t, val); // FIXME: I suppose this gets freed by raft_apply?
+            // Logf(s->id, "Parsed request: %c %lu", cmd[0], val);
+            struct raft_apply *creq = raft_malloc(sizeof *creq);
+            client_request_ident *cri = raft_malloc(sizeof *cri);
+            cri->server = s;
+            cri->client = client;
+            creq->data = cri;
 
-        int rv = raft_apply(&s->raft, creq, &rb, 1, respond_to_request);
-        if (rv != 0) {
-            Logf(s->id, "raft_apply(): %s", raft_errmsg(&s->raft));
-            return;
+            int rv = raft_apply(&s->raft, creq, &rb, 1, respond_to_request);
+            if (rv != 0) {
+                Logf(s->id, "raft_apply(): %s", raft_errmsg(&s->raft));
+                return;
+            }
         }
     }
     if (nread < 0) {
