@@ -2,11 +2,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #include "../include/raft.h"
 #include "../include/raft/uv.h"
 
-#define N_SERVERS 3    /* Number of servers in the example cluster */
+#define MAX_PEERS 128  /* Max number of peers in a cluster */
 #define APPLY_RATE 125 /* Apply a new entry every 125 milliseconds */
 
 #define Log(SERVER_ID, FORMAT) printf("%d: " FORMAT "\n", SERVER_ID)
@@ -15,13 +16,40 @@
 
 /********************************************************************
  *
- * Sample application FSM that just increases a counter.
+ * Sample application FSM that maintains a read-write register
  *
  ********************************************************************/
 
+enum fsm_op_type {OP_READ, OP_WRITE};
+struct fsm_op {
+    enum fsm_op_type type;
+    uint64_t value;
+};
+
+struct raft_buffer CreateRequest(enum fsm_op_type type, uint64_t val)
+{
+    struct raft_buffer buf;
+    buf.len = sizeof(struct fsm_op);
+    buf.base = raft_malloc(buf.len);
+    if (buf.base == NULL) {
+        return buf;
+    }
+    struct fsm_op* op = buf.base;
+    op->type = type;
+    op->value = val;
+    return buf;
+}
+
+struct raft_buffer CreateRandomRequest(void)
+{
+    enum fsm_op_type type = random() % 2;
+    uint64_t val = ((uint64_t) random()) % 100;
+    return CreateRequest(type, val);
+}
+
 struct Fsm
 {
-    unsigned long long count;
+    unsigned long long reg;
 };
 
 static int FsmApply(struct raft_fsm *fsm,
@@ -29,11 +57,25 @@ static int FsmApply(struct raft_fsm *fsm,
                     void **result)
 {
     struct Fsm *f = fsm->data;
-    if (buf->len != 8) {
+    if (buf->len != sizeof(struct fsm_op)) {
+        printf("Malformed: expected length %ld, got %ld\n", sizeof(struct fsm_op), buf->len);
         return RAFT_MALFORMED;
     }
-    f->count += *(uint64_t *)buf->base;
-    *result = &f->count;
+    struct fsm_op* op = buf->base;
+    switch(op->type) {
+        case OP_WRITE:
+            f->reg = op->value;
+            *result = &f->reg;
+            break;
+        case OP_READ:
+            *result = &f->reg;
+            break;
+    }
+    if (op->type == OP_READ) {
+        printf("R: %lld\n", f->reg);
+    } else {
+        printf("W -> %lld\n", f->reg);
+    }
     return 0;
 }
 
@@ -52,7 +94,8 @@ static int FsmSnapshot(struct raft_fsm *fsm,
     if ((*bufs)[0].base == NULL) {
         return RAFT_NOMEM;
     }
-    *(uint64_t *)(*bufs)[0].base = f->count;
+    *(uint64_t *)(*bufs)[0].base = f->reg;
+    printf("Snapshotted value: %lld\n", f->reg);
     return 0;
 }
 
@@ -60,10 +103,12 @@ static int FsmRestore(struct raft_fsm *fsm, struct raft_buffer *buf)
 {
     struct Fsm *f = fsm->data;
     if (buf->len != sizeof(uint64_t)) {
+        printf("Malformed during attemmpted restore.\n");
         return RAFT_MALFORMED;
     }
-    f->count = *(uint64_t *)buf->base;
+    f->reg = *(uint64_t *)buf->base;
     raft_free(buf->base);
+    printf("Restored value: %lld\n", f->reg);
     return 0;
 }
 
@@ -73,12 +118,11 @@ static int FsmInit(struct raft_fsm *fsm)
     if (f == NULL) {
         return RAFT_NOMEM;
     }
-    f->count = 0;
-    fsm->version = 2;
+    f->reg = 0;
+    fsm->version = 1;
     fsm->data = f;
     fsm->apply = FsmApply;
     fsm->snapshot = FsmSnapshot;
-    fsm->snapshot_finalize = NULL;
     fsm->restore = FsmRestore;
     return 0;
 }
@@ -114,6 +158,7 @@ struct Server
     struct raft raft;                   /* Raft instance. */
     struct raft_transfer transfer;      /* Transfer leadership request. */
     ServerCloseCb close_cb;             /* Optional close callback. */
+    uv_tcp_t req_server;                /* TCP server for client requests. */
 };
 
 static void serverRaftCloseCb(struct raft *raft)
@@ -157,7 +202,10 @@ static void serverTimerCloseCb(struct uv_handle_s *handle)
 static int ServerInit(struct Server *s,
                       struct uv_loop_s *loop,
                       const char *dir,
-                      unsigned id)
+                      unsigned id,
+                      const char *bind,
+                      char *nodes[],
+                      unsigned num_nodes)
 {
     struct raft_configuration configuration;
     struct timespec now;
@@ -204,7 +252,10 @@ static int ServerInit(struct Server *s,
     s->id = id;
 
     /* Render the address. */
-    sprintf(s->address, "127.0.0.1:900%d", id);
+    // sprintf(s->address, "172.22.0.%d:900%d", id + 1, id);
+    const unsigned ADDR_SIZE = 64;
+    strncpy(s->address, bind, ADDR_SIZE - 1);
+    printf("Starting on %s\n", s->address);
 
     /* Initialize and start the engine, using the libuv-based I/O backend. */
     rv = raft_init(&s->raft, &s->io, &s->fsm, id, s->address);
@@ -216,10 +267,11 @@ static int ServerInit(struct Server *s,
 
     /* Bootstrap the initial configuration if needed. */
     raft_configuration_init(&configuration);
-    for (i = 0; i < N_SERVERS; i++) {
+    for (i = 0; i < num_nodes; i++) {
         char address[64];
         unsigned server_id = i + 1;
-        sprintf(address, "127.0.0.1:900%d", server_id);
+        strncpy(address, nodes[i], ADDR_SIZE - 1);
+        printf("  Other node on %s\n", address);
         rv = raft_configuration_add(&configuration, server_id, address,
                                     RAFT_VOTER);
         if (rv != 0) {
@@ -258,7 +310,7 @@ err:
 static void serverApplyCb(struct raft_apply *req, int status, void *result)
 {
     struct Server *s = req->data;
-    int count;
+    uint64_t res;
     raft_free(req);
     if (status != 0) {
         if (status != RAFT_LEADERSHIPLOST) {
@@ -267,32 +319,24 @@ static void serverApplyCb(struct raft_apply *req, int status, void *result)
         }
         return;
     }
-    count = *(int *)result;
-    if (count % 100 == 0) {
-        Logf(s->id, "count %d", count);
-    }
+    res = *(uint64_t *)result;
 }
 
 /* Called periodically every APPLY_RATE milliseconds. */
 static void serverTimerCb(uv_timer_t *timer)
 {
     struct Server *s = timer->data;
-    struct raft_buffer buf;
     struct raft_apply *req;
     int rv;
 
     if (s->raft.state != RAFT_LEADER) {
         return;
     }
-
-    buf.len = sizeof(uint64_t);
-    buf.base = raft_malloc(buf.len);
+    struct raft_buffer buf = CreateRandomRequest();
     if (buf.base == NULL) {
         Log(s->id, "serverTimerCb(): out of memory");
         return;
     }
-
-    *(uint64_t *)buf.base = 1;
 
     req = raft_malloc(sizeof *req);
     if (req == NULL) {
@@ -300,7 +344,6 @@ static void serverTimerCb(uv_timer_t *timer)
         return;
     }
     req->data = s;
-
     rv = raft_apply(&s->raft, req, &buf, 1, serverApplyCb);
     if (rv != 0) {
         Logf(s->id, "raft_apply(): %s", raft_errmsg(&s->raft));
@@ -320,11 +363,12 @@ static int ServerStart(struct Server *s)
         Logf(s->id, "raft_start(): %s", raft_errmsg(&s->raft));
         goto err;
     }
-    rv = uv_timer_start(&s->timer, serverTimerCb, 0, 125);
-    if (rv != 0) {
-        Logf(s->id, "uv_timer_start(): %s", uv_strerror(rv));
-        goto err;
-    }
+    // Artificially create requests on a timer
+    // rv = uv_timer_start(&s->timer, serverTimerCb, 0, APPLY_RATE);
+    // if (rv != 0) {
+    //     Logf(s->id, "uv_timer_start(): %s", uv_strerror(rv));
+    //     goto err;
+    // }
 
     return 0;
 
@@ -353,6 +397,7 @@ static void ServerClose(struct Server *s, ServerCloseCb cb)
  * Top-level main loop.
  *
  ********************************************************************/
+struct uv_loop_s loop;
 
 static void mainServerCloseCb(struct Server *server)
 {
@@ -370,21 +415,215 @@ static void mainSigintCb(struct uv_signal_s *handle, int signum)
     ServerClose(server, mainServerCloseCb);
 }
 
+/********************************************************************
+ * Handle requests from clients over a TCP connection.
+ *******************************************************************/
+typedef struct {
+    void *data;
+    uv_write_t req;
+    uv_buf_t buf;
+} write_req_t;
+
+// Used to keep track of whom to respond to for a particular request
+typedef struct {
+    struct Server *server;
+    uv_stream_t *client;
+} client_request_ident;
+
+void alloc_buffer(uv_handle_t* handle, size_t suggested_size, uv_buf_t* buf);
+void on_new_connection(uv_stream_t *server, int status);
+void read_cb(uv_stream_t *client, ssize_t nread, const uv_buf_t *buf);
+void respond_to_request(struct raft_apply *req, int status, void *result);
+void after_reply(uv_write_t* req, int status);
+
+void alloc_buffer(uv_handle_t* handle, size_t suggested_size, uv_buf_t* buf) {
+    buf->base = (char*)malloc(suggested_size);
+    buf->len = suggested_size;
+}
+
+void on_new_connection(uv_stream_t *server, int status) {
+    struct Server *s = server->data;
+    if (status < 0) {
+        fprintf(stderr, "New connection error %s\n", uv_strerror(status));
+        return;
+    }
+    uv_tcp_t *client = (uv_tcp_t *) malloc(sizeof(uv_tcp_t));
+    client->data = s;
+    uv_tcp_init(&loop, client);
+    if (uv_accept(server, (uv_stream_t *) client) == 0) {
+        uv_read_start((uv_stream_t *) client, alloc_buffer, read_cb);
+    }
+    else {
+        uv_close((uv_handle_t *) client, NULL);
+    }
+}
+
+void reply_with_leader_address(struct Server *s, uv_stream_t *client) {
+    raft_id id;
+    const char *leader_address;
+    raft_leader(&s->raft, &id, &leader_address);
+    if (leader_address == NULL) {
+        leader_address = "";
+    }
+    char *reply = malloc(strlen(leader_address) + 5);
+    sprintf(reply, "L %s\n", leader_address);
+
+    // identify client for after_reply
+    client_request_ident *cri = raft_malloc(sizeof *cri);
+    cri->server = s;
+    cri->client = client;
+
+    // respond with result
+    write_req_t* rreq = (write_req_t*)malloc(sizeof(write_req_t));
+    rreq->buf = uv_buf_init(reply, strlen(reply));
+    rreq->data = cri;
+    uv_write((uv_write_t*) rreq, client, &rreq->buf, 1, after_reply);
+
+}
+
+void read_cb(uv_stream_t* client, ssize_t nread, const uv_buf_t* buf) {
+    // Compare with serverTimerCb
+    // check if Raft leader
+    struct Server *s = client->data;
+    
+    // Show we're not the leader by immediately closing the connection
+    if (s->raft.state != RAFT_LEADER) {
+        reply_with_leader_address(s, client);
+        // uv_close((uv_handle_t*)client, NULL);
+        free(buf->base);
+        return;
+    }
+
+    char *cmd = buf->base;
+    // Logf(s->id, "Received request: %s", cmd);
+    if (nread > 0) {
+        // Only accept R or W [int] requests
+        if (!(cmd[0] == 'R' || cmd[0] == 'W')) {
+            Logf(s->id, "Invalid request: %s", cmd);
+            uv_close((uv_handle_t*)client, NULL);
+        }
+
+        // Parse request
+        enum fsm_op_type t = cmd[0] == 'R' ? OP_READ : OP_WRITE;
+        uint64_t val = 0;
+        if (t == OP_WRITE) {
+            val = (uint64_t) atoi(&cmd[1]);
+        }
+        // TODO: add OOM checks
+        struct raft_buffer rb = CreateRequest(t, val); // FIXME: I suppose this gets freed by raft_apply?
+        // Logf(s->id, "Parsed request: %c %lu", cmd[0], val);
+        struct raft_apply *creq = raft_malloc(sizeof *creq);
+        client_request_ident *cri = raft_malloc(sizeof *cri);
+        cri->server = s;
+        cri->client = client;
+        creq->data = cri;
+
+        int rv = raft_apply(&s->raft, creq, &rb, 1, respond_to_request);
+        if (rv != 0) {
+            Logf(s->id, "raft_apply(): %s", raft_errmsg(&s->raft));
+            return;
+        }
+    }
+    if (nread < 0) {
+        if (nread != UV_EOF) {
+            fprintf(stderr, "Read error %s\n", uv_err_name(nread));
+        }
+        uv_close((uv_handle_t*)client, NULL);
+    }
+    free(buf->base);
+}
+
+void respond_to_request(struct raft_apply *req, int status, void *result) {
+    client_request_ident *cri = req->data;
+    struct Server *s = cri->server;
+
+    raft_free(req);
+    if (status != 0) {
+        if (status != RAFT_LEADERSHIPLOST) {
+            Logf(s->id, "raft_apply() callback: %s (%d)", raft_errmsg(&s->raft),
+                 status);
+        }
+        return;
+    }
+    uint64_t res = *(uint64_t *)result;
+    const size_t max_resp_sz = 64;
+    char *res_str = raft_malloc(max_resp_sz);
+    int res_len = snprintf(res_str, max_resp_sz, "%ld\n", res);
+    // respond with result
+    write_req_t* rreq = (write_req_t*)malloc(sizeof(write_req_t));
+    rreq->buf = uv_buf_init(res_str, res_len);
+    rreq->data = cri;
+    uv_write((uv_write_t*) rreq, cri->client, &rreq->buf, 1, after_reply);
+
+    // raft_free(cri);
+}
+
+void after_reply(uv_write_t* req, int status) {
+    if (status) {
+        fprintf(stderr, "Write error %s\n", uv_strerror(status));
+    }
+    write_req_t* wr = (write_req_t*)req;
+    // Close the connection
+    client_request_ident *cri = wr->data;
+    uv_handle_t *client = (uv_handle_t *) cri->client;
+    uv_close((uv_handle_t*)client, NULL);
+    // Free resources
+    free(wr->buf.base);
+    free(wr);
+    free(cri);
+}
+
 int main(int argc, char *argv[])
 {
-    struct uv_loop_s loop;
+    setbuf(stdout, NULL);
     struct uv_signal_s sigint; /* To catch SIGINT and exit. */
     struct Server server;
-    const char *dir;
-    unsigned id;
+    const char *dir = NULL;
+    unsigned id = 0;
+    const char *bind = NULL;
+    unsigned client_port = 0;
+    unsigned num_nodes = 0;
+    char *peers[MAX_PEERS];
     int rv;
 
-    if (argc != 3) {
-        printf("usage: example-server <dir> <id>\n");
+    int opt;
+    /*
+        -d <dir>
+        -i <id>
+        -b <addr:port> to bind on
+        -n <addr:port> of node in the cluster (can be repeated; must include current node)
+     */
+    while ((opt = getopt(argc, argv, "d:i:b:p:n:")) != -1) {
+        switch(opt) {
+            case 'd':
+                dir = strdup(optarg);
+                break;
+            case 'i':
+                id = (unsigned) atoi(optarg);
+                break;
+            case 'b':
+                bind = strdup(optarg);
+                break;
+            case 'p':
+                client_port = (unsigned) atoi(optarg);
+                break;
+            case 'n':
+                peers[num_nodes++] = strdup(optarg);
+                break;
+            case '?':
+                printf("Unknown option: %c\n", optopt);
+                break;
+            case ':':
+                printf("Missing arg for %c\n", optopt);
+                break;
+        }
+    }
+    if (dir == NULL || id == 0 || bind == NULL || client_port == 0 || num_nodes == 0) {
+        printf("Usage: %s -d <dir> -i <id> -b <addr:port> -p <port> -n <addr:port>\n",
+               argv[0]);
         return 1;
     }
-    dir = argv[1];
-    id = (unsigned)atoi(argv[2]);
+    Log(id, "Entry");
 
     /* Ignore SIGPIPE, see https://github.com/joyent/libuv/issues/1254 */
     signal(SIGPIPE, SIG_IGN);
@@ -397,7 +636,7 @@ int main(int argc, char *argv[])
     }
 
     /* Initialize the example server. */
-    rv = ServerInit(&server, &loop, dir, id);
+    rv = ServerInit(&server, &loop, dir, id, bind, peers, num_nodes);
     if (rv != 0) {
         goto err_after_server_init;
     }
@@ -421,13 +660,29 @@ int main(int argc, char *argv[])
         goto err_after_signal_init;
     }
 
+    /* Start listening for client requests. */
+    struct sockaddr_in req_addr;
+    uv_ip4_addr("0.0.0.0", client_port, &req_addr);
+    uv_tcp_init(&loop, &server.req_server);
+    server.req_server.data = &server;
+    uv_tcp_bind(&server.req_server, (const struct sockaddr*) &req_addr, 0);
+    const int conn_backlog = 128;
+    int r = uv_listen((uv_stream_t *) &server.req_server, conn_backlog, on_new_connection);
+    if (r) {
+        return fprintf(stderr, "Error on listening: %s.\n", 
+                uv_strerror(r));
+    }
+    Logf(id, "Listening for client requests on port %d", client_port);
+
     /* Run the event loop until we receive SIGINT. */
     rv = uv_run(&loop, UV_RUN_DEFAULT);
     if (rv != 0) {
         Logf(id, "uv_run_start(): %s", uv_strerror(rv));
     }
 
+    Log(id, "pre close reached");
     uv_loop_close(&loop);
+    Log(id, "close reached");
 
     return rv;
 
