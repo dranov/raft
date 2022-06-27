@@ -425,6 +425,12 @@ typedef struct {
     uv_buf_t buf;
 } write_req_t;
 
+typedef struct {
+    void *data;
+    uv_buf_t buf;
+    uv_stream_t *client;
+} admin_command_t;
+
 // Used to keep track of whom to respond to for a particular request
 typedef struct {
     struct Server *server;
@@ -442,6 +448,7 @@ void on_new_connection(uv_stream_t *server, int status);
 void read_cb(uv_stream_t *client, ssize_t nread, const uv_buf_t *buf);
 void respond_to_request(struct raft_apply *req, int status, void *result);
 void after_reply(uv_write_t* req, int status);
+void after_reply_to_administrative_command(uv_write_t *req, int status);
 
 void alloc_buffer(uv_handle_t* handle, size_t suggested_size, uv_buf_t* buf) {
     buf->base = (char*)malloc(suggested_size);
@@ -503,29 +510,45 @@ void after_removal(struct raft_change *req, int status) {
     fprintf(stderr, "Removed server ID %llu -> RET %d\n", as->serv_id, status);
 }
 
+char *configuration_to_string(struct raft_configuration *c) {
+    unsigned n = c->n;
+    char *str = raft_malloc(ADDR_LEN * (n + 2));
+    unsigned num_chars = 0;
+
+    for (unsigned i = 0 ; i < n; i++) {
+        struct raft_server *s = &(c->servers[i]);
+        num_chars += sprintf(str + num_chars, "%d -> %s ", s->id, s->address);
+    }
+    return str;
+}
+
 void read_cb(uv_stream_t* client, ssize_t nread, const uv_buf_t* buf) {
     // Compare with serverTimerCb
     // check if Raft leader
     struct Server *s = client->data;
-    
+    char *cmd = buf->base;
+
+    // If we are not the leader, we can only serve C = Configuration requests
     // Show we're not the leader by immediately closing the connection
-    if (s->raft.state != RAFT_LEADER) {
+    bool can_service_request = s->raft.state == RAFT_LEADER || cmd[0] == 'C';
+    if (!can_service_request) {
         reply_with_leader_address(s, client);
         // uv_close((uv_handle_t*)client, NULL);
         free(buf->base);
         return;
     }
 
-    char *cmd = buf->base;
     // Logf(s->id, "Received request: %s", cmd);
     if (nread > 0) {
         // Specially handle configuration change requests
         // A = Add [id] [ip:port]
         // R = Remove [id]
-        if (cmd[0] == 'A' || cmd[0] == 'D') {
+        // C = (Print) Configuration
+        if (cmd[0] == 'A' || cmd[0] == 'D' || cmd[0] == 'C') {
             // fprintf(stderr, "Received membership request: %s", cmd);
-            int rv;
+            int rv = 0;
             raft_id serv_id;
+            char *reply = NULL;
 
             if (cmd[0] == 'A') {
                 char serv_address[ADDR_LEN];
@@ -543,7 +566,7 @@ void read_cb(uv_stream_t* client, ssize_t nread, const uv_buf_t* buf) {
                 // after the add completes, promote_server is called (callback) to make it a voter
                 rv = raft_add(&s->raft, rc, serv_id, serv_address, promote_server_to_voter_after_join);
                 fprintf(stderr, "Trying to add server with ID %llu at %s -> RET %s\n", serv_id, serv_address, rv == 0 ? "OK" : raft_strerror(rv));
-            } else { // (cmd[0] == 'D')
+            } else if (cmd[0] == 'D') {
                 sscanf(cmd, "D %llu", &serv_id);
                 add_server_t *as = raft_malloc(sizeof *as);
                 as->data = s;
@@ -555,11 +578,42 @@ void read_cb(uv_stream_t* client, ssize_t nread, const uv_buf_t* buf) {
                 rc->cb = NULL;
                 rv = raft_remove(&s->raft, rc, serv_id, after_removal);
                 fprintf(stderr, "Trying to remove server with ID %llu -> RET %s\n", serv_id, rv == 0 ? "OK" : raft_strerror(rv));
+            } else { // (cmd[0] == 'C')
+                // we get a copy in case it changes while we execute (?)
+                struct raft_configuration rc = s->raft.configuration;
+                // reserve enough space for the reply
+                unsigned chars_needed = 0;
+                for (unsigned i = 0; i < rc.n; i++) {
+                    // hack to get the number of characters in ID; per https://stackoverflow.com/a/7200873
+                    unsigned ndigits = snprintf(NULL, 0, "%llu", rc.servers[i].id);
+                    chars_needed += ndigits;
+                    chars_needed += strlen(rc.servers[i].address);
+                    chars_needed += 6; // spacing: ID -> ADDR
+                }
+                char *reply = raft_malloc(chars_needed);
+                int chars_written = 0;
+                // iterate over servers in the configuration
+                for (unsigned i = 0; i < rc.n; i++) {
+                    struct raft_server *serv = &rc.servers[i];
+                    chars_written += sprintf(reply + chars_written, "%llu -> %s ", serv->id, serv->address);
+                }
+                fprintf(stderr, "%s\n", reply);
             }
-            // TODO: respond with status message
+            // respond with configuration or status message
+            if (reply == NULL) {
+                reply = rv == 0 ? strdup("OK") : strdup(raft_strerror(rv));
+            }
+            admin_command_t *ac = raft_malloc(sizeof(admin_command_t));
+            uv_write_t *rp = raft_malloc(sizeof(uv_write_t));
+            ac->data = ac;
+            ac->buf = uv_buf_init(reply, strlen(reply));;
+            ac->client = client;
+            rp->data = ac;
+            uv_write((uv_write_t*) rp, client, &ac->buf, 1, after_reply_to_administrative_command);
+
             // char *str_ret = rv == 0 ? "OK" : raft_strerror(rv);
             // Close the connection to the client after scheduling the configuration change
-            uv_close((uv_handle_t*)client, NULL);
+            // uv_close((uv_handle_t*)client, NULL);
         } else {
             // Only accept R or W [int] requests
             if (!(cmd[0] == 'R' || cmd[0] == 'W')) {
@@ -623,6 +677,16 @@ void respond_to_request(struct raft_apply *req, int status, void *result) {
     uv_write((uv_write_t*) rreq, cri->client, &rreq->buf, 1, after_reply);
 
     // raft_free(cri);
+}
+
+void after_reply_to_administrative_command(uv_write_t *req, int status) {
+    // Close the connection
+    admin_command_t *ac = req->data;
+    uv_close((uv_handle_t*) ac->client, NULL);
+    // Free resources
+    free(ac->buf.base);
+    free(ac);
+    free(req);
 }
 
 void after_reply(uv_write_t* req, int status) {
