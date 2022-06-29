@@ -595,7 +595,7 @@ void read_cb(uv_stream_t* client, ssize_t nread, const uv_buf_t* buf) {
                 // iterate over servers in the configuration
                 for (unsigned i = 0; i < rc.n; i++) {
                     struct raft_server *serv = &rc.servers[i];
-                    chars_written += sprintf(reply + chars_written, "%llu -> %s ", serv->id, serv->address);
+                    chars_written += sprintf(reply + chars_written, "%llu %s;", serv->id, serv->address);
                 }
                 fprintf(stderr, "%s\n", reply);
             }
