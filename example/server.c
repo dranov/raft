@@ -590,7 +590,7 @@ void read_cb(uv_stream_t* client, ssize_t nread, const uv_buf_t* buf) {
                     chars_needed += strlen(rc.servers[i].address);
                     chars_needed += 6; // spacing: ID -> ADDR
                 }
-                char *reply = raft_malloc(chars_needed);
+                reply = raft_malloc(chars_needed);
                 int chars_written = 0;
                 // iterate over servers in the configuration
                 for (unsigned i = 0; i < rc.n; i++) {
