@@ -599,7 +599,7 @@ void read_cb(uv_stream_t* client, ssize_t nread, const uv_buf_t* buf) {
                 // iterate over servers in the configuration
                 for (unsigned i = 0; i < rc.n; i++) {
                     struct raft_server *serv = &rc.servers[i];
-                    char replica_type = (i == leader_id) ? 'L' : 'F'; // leader or follower
+                    char replica_type = (serv->id == leader_id) ? 'L' : 'F'; // leader or follower
                     chars_written += sprintf(reply + chars_written, "%llu %s %c;", serv->id, serv->address, replica_type);
                 }
                 fprintf(stderr, "%s\n", reply);
