@@ -176,10 +176,13 @@ static int tickLeader(struct raft *r)
             r->leader_state.round_start = 0;
 
             change = r->leader_state.change;
+            tracef("change: %p | change->cb: %p", (void*) change, (void*)(size_t)change->cb);
             r->leader_state.change = NULL;
-            if (change != NULL && change->cb != NULL) {
-                tracef("change: %p | change->cb: %p", (void*) change, (void*)(size_t)change->cb);
-                change->cb(change, RAFT_NOCONNECTION);
+            if (change != NULL) {
+                if (change->cb != NULL) {
+                    tracef("change: %p | change->cb: %p", (void*) change, (void*)(size_t)change->cb);
+                    change->cb(change, RAFT_NOCONNECTION);
+                }
             }
         }
     }

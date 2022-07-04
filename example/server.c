@@ -500,7 +500,9 @@ void promote_server_to_voter_after_join(struct raft_change *req, int status) {
     add_server_t *as = req->data;
     struct Server *s = as->data;
 
+    fprintf(stderr, "[Promote] req->cb = %p", (void*)(size_t) req->cb);
     int rv = raft_assign(&s->raft, req, as->serv_id, RAFT_VOTER, NULL);
+    fprintf(stderr, "[Promote after assign] req->cb = %p", (void*)(size_t) req->cb);
     fprintf(stderr, "[Add CB status: %d] Trying to make server ID %llu (%s) a voter -> RET %s\n", status, as->serv_id, as->serv_address, rv == 0 ? "OK" : raft_strerror(rv));
     // TODO: free memory
 }
@@ -508,6 +510,7 @@ void promote_server_to_voter_after_join(struct raft_change *req, int status) {
 void after_removal(struct raft_change *req, int status) {
     add_server_t *as = req->data;
     struct Server *s = as->data;
+    fprintf(stderr, "[After removal] req->cb = %p", (void*)(size_t) req->cb);
     fprintf(stderr, "Removed server ID %llu -> RET %d\n", as->serv_id, status);
 }
 
@@ -566,6 +569,7 @@ void read_cb(uv_stream_t* client, ssize_t nread, const uv_buf_t* buf) {
                 // By default, nodes are given the RAFT_STANDY log --> they replicate the log, but do not vote
                 // after the add completes, promote_server is called (callback) to make it a voter
                 rv = raft_add(&s->raft, rc, serv_id, serv_address, promote_server_to_voter_after_join);
+                fprintf(stderr, "[After add] rc->cb = %p", (void*)(size_t) rc->cb);
                 fprintf(stderr, "Trying to add server with ID %llu at %s -> RET %s\n", serv_id, serv_address, rv == 0 ? "OK" : raft_strerror(rv));
             } else if (cmd[0] == 'D') {
                 sscanf(cmd, "D %llu", &serv_id);
@@ -578,6 +582,7 @@ void read_cb(uv_stream_t* client, ssize_t nread, const uv_buf_t* buf) {
                 rc->data = as;
                 rc->cb = NULL;
                 rv = raft_remove(&s->raft, rc, serv_id, after_removal);
+                fprintf(stderr, "[After remove] rc->cb = %p", (void*)(size_t) rc->cb);
                 fprintf(stderr, "Trying to remove server with ID %llu -> RET %s\n", serv_id, rv == 0 ? "OK" : raft_strerror(rv));
             } else { // (cmd[0] == 'C')
                 // we get a copy in case it changes while we execute (?)
