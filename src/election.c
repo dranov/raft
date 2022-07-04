@@ -301,9 +301,9 @@ bool electionTally(struct raft *r, size_t voter_index)
         }
     }
 
-    tracef("Received %llu votes, needed %llu. Vote map: ", votes, half + 1);
+    tracef("Received %lu votes, needed %lu. Vote map: ", votes, half + 1);
     for (i = 0; i < n_voters; i++) {
-        tracef("Voter ID %llu: %d", i, r->candidate_state.votes[i]);
+        tracef("Voter ID %lu: %d", i, r->candidate_state.votes[i]);
     }
 
     return votes >= half + 1;

@@ -217,6 +217,7 @@ static int ServerInit(struct Server *s,
 
     /* Seed the random generator */
     timespec_get(&now, TIME_UTC);
+    Logf(s->id, "Initializing random number generator (RNG) with seed: %u", (unsigned)(now.tv_nsec ^ now.tv_sec));
     srandom((unsigned)(now.tv_nsec ^ now.tv_sec));
 
     s->loop = loop;
