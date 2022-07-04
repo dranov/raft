@@ -178,6 +178,7 @@ static int tickLeader(struct raft *r)
             change = r->leader_state.change;
             r->leader_state.change = NULL;
             if (change != NULL && change->cb != NULL) {
+                tracef("change: %p | change->cb: %p", (void*) change, (void*)(size_t)change->cb);
                 change->cb(change, RAFT_NOCONNECTION);
             }
         }
