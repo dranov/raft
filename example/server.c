@@ -593,10 +593,14 @@ void read_cb(uv_stream_t* client, ssize_t nread, const uv_buf_t* buf) {
                 }
                 reply = raft_malloc(chars_needed);
                 int chars_written = 0;
+                raft_id leader_id;
+                const char *leader_address;
+                raft_leader(&s->raft, &leader_id, &leader_address);
                 // iterate over servers in the configuration
                 for (unsigned i = 0; i < rc.n; i++) {
                     struct raft_server *serv = &rc.servers[i];
-                    chars_written += sprintf(reply + chars_written, "%llu %s;", serv->id, serv->address);
+                    char replica_type = (i == leader_id) ? 'L' : 'F'; // leader or follower
+                    chars_written += sprintf(reply + chars_written, "%llu %s %c;", serv->id, serv->address, replica_type);
                 }
                 fprintf(stderr, "%s\n", reply);
             }
