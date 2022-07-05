@@ -20,12 +20,12 @@ int membershipCanChangeConfiguration(struct raft *r)
         goto err;
     }
 
-    // XXX BUG manually INTRODUCED:
-    // if (r->configuration_uncommitted_index != 0) {
-    //     tracef("r->configuration_uncommitted_index %llu", r->configuration_uncommitted_index);
-    //     rv = RAFT_CANTCHANGE;
-    //     goto err;
-    // }
+    // XXX BUG manually INTRODUCED by commenting the following out:
+    if (r->configuration_uncommitted_index != 0) {
+        tracef("r->configuration_uncommitted_index %llu", r->configuration_uncommitted_index);
+        rv = RAFT_CANTCHANGE;
+        goto err;
+    }
 
     if (r->leader_state.promotee_id != 0) {
         tracef("r->leader_state.promotee_id %llu", r->leader_state.promotee_id);
