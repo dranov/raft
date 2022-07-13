@@ -721,6 +721,18 @@ int main(int argc, char *argv[])
     setbuf(stdout, NULL);
     struct uv_signal_s sigint; /* To catch SIGINT and exit. */
     struct Server server;
+
+    // printf(">>> current_term address: %p\n", (void*)&(server.raft.current_term));
+    DS_STATE_SAVING(&(server.raft.current_term), sizeof(unsigned long long));
+    // printf(">>> commit_index address: %p\n", (void*)&(server.raft.commit_index));
+    DS_STATE_SAVING(&(server.raft.commit_index), sizeof(unsigned long long));
+    // printf(">>> log_entry.size address: %p\n", (void*)&(server.raft.log.size));
+    DS_STATE_SAVING(&(server.raft.log.size), sizeof(unsigned long long));
+    // printf(">>> log_entry.front address: %p\n", (void*)&(server.raft.log.front));
+    DS_STATE_SAVING(&(server.raft.log.front), sizeof(unsigned long long));
+    // printf(">>> log_entry.back address: %p\n", (void*)&(server.raft.log.back));
+    DS_STATE_SAVING(&(server.raft.log.back), sizeof(unsigned long long));
+
     const char *dir = NULL;
     unsigned id = 0;
     const char *bind = NULL;
