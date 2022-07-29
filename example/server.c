@@ -3,7 +3,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-#include "/opt/instrumentor/include/afl-rt.h"
+#include "/opt/instrumentor/llvm_mode/include/afl-rt.h"
 
 #include "../include/raft.h"
 #include "../include/raft/uv.h"
